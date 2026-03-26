@@ -35,8 +35,8 @@ MAX_DEPTH = 3
 MAX_LEAF_NODES = 3
 RANDOM_STATE = 42
 
-RF_N_ESTIMATORS = 1000
-OPTUNA_TRIALS = 30
+RF_N_ESTIMATORS = 500
+OPTUNA_TRIALS = 15
 
 # ==========================================================
 # COLUMNAS REQUERIDAS
