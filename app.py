@@ -1009,7 +1009,7 @@ st.code(rules_text, language="text")
 # ==========================================================
 st.subheader("Importancia de variables")
 st.caption(
-    "Modelo multivariable con Random Forest (1000 árboles) optimizado con Optuna "
+    "Modelo multivariable con Random Forest (500 árboles) optimizado con Optuna "
     f"({OPTUNA_TRIALS} trials, métrica objetivo = RMSE). "
     "Se omiten importancias iguales a 0 y las visibles se reescalan para sumar 100%."
 )
