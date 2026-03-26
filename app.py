@@ -3,7 +3,7 @@
 # STREAMLIT APP: Árbol de decisión univariable
 # Fenología vs métricas productivas
 # Optimizado para EXACTAMENTE 3 nodos finales (3 hojas)
-# + Boxplot por regla del árbol con estadísticos
+# + Boxplot por regla del árbol con ANOVA
 # ==========================================================
 
 import os
@@ -15,7 +15,7 @@ import plotly.express as px
 from sklearn.tree import DecisionTreeRegressor, export_text, _tree
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
-from scipy.stats import kruskal
+from scipy.stats import f_oneway
 
 # ==========================================================
 # CONFIG
@@ -506,7 +506,6 @@ def build_boxplot_df(model_df_pred: pd.DataFrame, ranges_table: pd.DataFrame) ->
         how="left"
     ).copy()
 
-    # Orden natural: Peor -> Medio -> Mejor
     order_df = (
         ranges_table[["REGLA", "Y_PRED_RANGO"]]
         .sort_values("Y_PRED_RANGO", ascending=True)
@@ -537,12 +536,12 @@ def make_boxplot(box_df: pd.DataFrame, y_label: str):
     return fig
 
 
-def compute_boxplot_stats(box_df: pd.DataFrame):
+def compute_anova_stats(box_df: pd.DataFrame):
     stats_rows = []
 
     grp = (
         box_df.groupby("REGLA", observed=False)["Y_VAL"]
-        .agg(["count", "mean", "std"])
+        .agg(["count", "mean", "std", "var"])
         .reset_index()
     )
 
@@ -552,6 +551,7 @@ def compute_boxplot_stats(box_df: pd.DataFrame):
         n = int(row["count"])
         mean_ = float(row["mean"]) if pd.notna(row["mean"]) else np.nan
         std_ = float(row["std"]) if pd.notna(row["std"]) else 0.0
+        var_ = float(row["var"]) if pd.notna(row["var"]) else 0.0
         cv_ = (std_ / mean_ * 100) if pd.notna(mean_) and mean_ != 0 else np.nan
 
         stats_rows.append({
@@ -559,19 +559,20 @@ def compute_boxplot_stats(box_df: pd.DataFrame):
             "N": n,
             "MEDIA": mean_,
             "DESV_STD": std_,
+            "VARIANZA": var_,
             "CV(%)": cv_
         })
 
     stats_df = pd.DataFrame(stats_rows)
 
     valid_groups = []
-    for g, sub in box_df.groupby("REGLA", observed=False):
+    for _, sub in box_df.groupby("REGLA", observed=False):
         vals = pd.to_numeric(sub["Y_VAL"], errors="coerce").dropna().values
         if len(vals) > 0:
             valid_groups.append(vals)
 
-    kw_result = {
-        "prueba": "Kruskal-Wallis",
+    anova_result = {
+        "prueba": "ANOVA",
         "estadistico": np.nan,
         "pvalor": np.nan,
         "N": int(box_df["Y_VAL"].notna().sum()),
@@ -579,11 +580,11 @@ def compute_boxplot_stats(box_df: pd.DataFrame):
     }
 
     if len(valid_groups) >= 2:
-        stat, pval = kruskal(*valid_groups)
-        kw_result["estadistico"] = float(stat)
-        kw_result["pvalor"] = float(pval)
+        stat, pval = f_oneway(*valid_groups)
+        anova_result["estadistico"] = float(stat)
+        anova_result["pvalor"] = float(pval)
 
-    return stats_df, kw_result
+    return stats_df, anova_result
 
 
 # ==========================================================
@@ -794,7 +795,7 @@ st.dataframe(
 )
 
 # ==========================================================
-# BOXPLOT POR REGLA
+# BOXPLOT + ANOVA
 # ==========================================================
 st.subheader("Boxplot por regla del árbol")
 st.caption(f"Los tres boxplots responden a la métrica general seleccionada: {y_label}")
@@ -803,19 +804,20 @@ box_df = build_boxplot_df(model_df_pred, ranges_table)
 box_fig = make_boxplot(box_df, y_label=y_label)
 st.plotly_chart(box_fig, use_container_width=True)
 
-stats_df, kw_result = compute_boxplot_stats(box_df)
+stats_df, anova_result = compute_anova_stats(box_df)
 
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Prueba", kw_result["prueba"])
-k2.metric("Estadístico (H)", f'{kw_result["estadistico"]:,.4f}' if pd.notna(kw_result["estadistico"]) else "NA")
-k3.metric("p-valor", f'{kw_result["pvalor"]:,.6f}' if pd.notna(kw_result["pvalor"]) else "NA")
-k4.metric("N", f'{kw_result["N"]:,}')
-k5.metric("Grupos", f'{kw_result["grupos"]:,}')
+k1.metric("Prueba", anova_result["prueba"])
+k2.metric("Estadístico (F)", f'{anova_result["estadistico"]:,.4f}' if pd.notna(anova_result["estadistico"]) else "NA")
+k3.metric("p-valor", f'{anova_result["pvalor"]:,.6f}' if pd.notna(anova_result["pvalor"]) else "NA")
+k4.metric("N", f'{anova_result["N"]:,}')
+k5.metric("Grupos", f'{anova_result["grupos"]:,}')
 
 st.dataframe(
     stats_df.style.format({
         "MEDIA": "{:,.4f}",
         "DESV_STD": "{:,.4f}",
+        "VARIANZA": "{:,.4f}",
         "CV(%)": "{:,.0f}%"
     }),
     use_container_width=True
