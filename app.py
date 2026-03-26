@@ -2,6 +2,7 @@
 # ==========================================================
 # STREAMLIT APP: Árbol de decisión univariable
 # Fenología vs métricas productivas
+# Optimizado para EXACTAMENTE 3 nodos finales (3 hojas)
 # ==========================================================
 
 import os
@@ -25,6 +26,7 @@ st.set_page_config(
 REQ_SHEET = "DATA"
 DATA_FILE = "CONSOLIDADO 2022-2026.xlsb"
 MAX_DEPTH = 3
+MAX_LEAF_NODES = 3   # <-- CLAVE: fuerza exactamente 3 hojas finales
 RANDOM_STATE = 42
 
 # ==========================================================
@@ -207,16 +209,12 @@ def ratio_kg_planta_over_unique_turno(df_subset: pd.DataFrame) -> float:
 def compute_metric_value(df_subset: pd.DataFrame, metric_name: str) -> float:
     if metric_name == "KG/HA":
         return ratio_kg_over_unique_turno_area(df_subset)
-
     if metric_name == "KG/PLANTA":
         return ratio_kg_planta_over_unique_turno(df_subset)
-
     if metric_name == "PESO BAYA (g)":
         return weighted_mean(df_subset["PESO BAYA (g)"], df_subset["kilogramos"])
-
     if metric_name == "CALIBRE BAYA (mm)":
         return weighted_mean(df_subset["CALIBRE BAYA (mm)"], df_subset["kilogramos"])
-
     return np.nan
 
 
@@ -307,30 +305,36 @@ def fit_tree_and_metrics(model_df: pd.DataFrame):
     X = model_df[["X_VAL"]].values
     y = model_df["Y_VAL"].values
 
-    model = DecisionTreeRegressor(max_depth=MAX_DEPTH, random_state=RANDOM_STATE)
-
     metric_mode = "full_sample"
     mae_ref = np.nan
     r2_ref = np.nan
+
+    base_params = {
+        "max_depth": MAX_DEPTH,
+        "max_leaf_nodes": MAX_LEAF_NODES,
+        "random_state": RANDOM_STATE
+    }
+
+    model_eval = DecisionTreeRegressor(**base_params)
 
     if len(model_df) >= 20 and model_df["X_VAL"].nunique() >= 4:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.20, random_state=RANDOM_STATE
         )
-        model.fit(X_train, y_train)
-        y_pred_test = model.predict(X_test)
+        model_eval.fit(X_train, y_train)
+        y_pred_test = model_eval.predict(X_test)
         mae_ref = mean_absolute_error(y_test, y_pred_test)
         r2_ref = r2_score(y_test, y_pred_test)
         metric_mode = "holdout_20"
     else:
-        model.fit(X, y)
-        y_pred_full = model.predict(X)
+        model_eval.fit(X, y)
+        y_pred_full = model_eval.predict(X)
         mae_ref = mean_absolute_error(y, y_pred_full)
         r2_ref = r2_score(y, y_pred_full) if len(np.unique(y)) > 1 else np.nan
 
-    # Modelo final para rangos y visualización
-    model_final = DecisionTreeRegressor(max_depth=MAX_DEPTH, random_state=RANDOM_STATE)
+    model_final = DecisionTreeRegressor(**base_params)
     model_final.fit(X, y)
+
     model_df = model_df.copy()
     model_df["Y_PRED"] = model_final.predict(X)
     model_df["LEAF_ID"] = model_final.apply(X)
@@ -348,36 +352,7 @@ def get_thresholds(model: DecisionTreeRegressor) -> list:
         if feature != _tree.TREE_UNDEFINED:
             thresholds.append(float(threshold))
 
-    thresholds = sorted(set(thresholds))
-    return thresholds
-
-
-def extract_leaf_ranges(model: DecisionTreeRegressor) -> list:
-    tree_ = model.tree_
-    feature_name = "X_VAL"
-    ranges = []
-
-    def recurse(node_id: int, low: float, high: float):
-        feature = tree_.feature[node_id]
-        threshold = tree_.threshold[node_id]
-
-        if feature != _tree.TREE_UNDEFINED:
-            recurse(tree_.children_left[node_id], low, min(high, float(threshold)))
-            recurse(tree_.children_right[node_id], max(low, float(threshold)), high)
-        else:
-            pred = float(tree_.value[node_id][0][0])
-            samples = int(tree_.n_node_samples[node_id])
-            ranges.append({
-                "leaf_id": node_id,
-                "x_low": low,
-                "x_high": high,
-                "pred": pred,
-                "samples_tree": samples,
-                "rule": build_rule_text(low, high, feature_name)
-            })
-
-    recurse(0, -np.inf, np.inf)
-    return ranges
+    return sorted(set(thresholds))
 
 
 def build_rule_text(low: float, high: float, feature_name: str = "X_VAL") -> str:
@@ -400,34 +375,55 @@ def human_range_label(low: float, high: float) -> str:
     return f"({low:,.4f} ; {high:,.4f}]"
 
 
+def extract_leaf_ranges(model: DecisionTreeRegressor) -> list:
+    tree_ = model.tree_
+    ranges = []
+
+    def recurse(node_id: int, low: float, high: float):
+        feature = tree_.feature[node_id]
+        threshold = tree_.threshold[node_id]
+
+        if feature != _tree.TREE_UNDEFINED:
+            recurse(tree_.children_left[node_id], low, min(high, float(threshold)))
+            recurse(tree_.children_right[node_id], max(low, float(threshold)), high)
+        else:
+            pred = float(tree_.value[node_id][0][0])
+            samples = int(tree_.n_node_samples[node_id])
+            ranges.append({
+                "leaf_id": node_id,
+                "x_low": low,
+                "x_high": high,
+                "pred": pred,
+                "samples_tree": samples,
+                "rule": build_rule_text(low, high, "X")
+            })
+
+    recurse(0, -np.inf, np.inf)
+    return ranges
+
+
 def assign_leaf_labels(range_df: pd.DataFrame) -> pd.DataFrame:
     range_df = range_df.sort_values("Y_PRED_RANGO", ascending=True).reset_index(drop=True)
-    n = len(range_df)
 
-    if n == 1:
-        range_df["CLASE_RANGO"] = "Único"
-        return range_df
-
-    if n == 2:
+    # Como ahora forzamos 3 hojas, la clasificación queda limpia:
+    # menor = Peor, medio = Medio, mayor = Mejor
+    if len(range_df) == 1:
+        range_df["CLASE_RANGO"] = ["Único"]
+    elif len(range_df) == 2:
         range_df["CLASE_RANGO"] = ["Peor", "Mejor"]
-        return range_df
+    elif len(range_df) >= 3:
+        labels = ["Peor", "Medio", "Mejor"]
+        if len(range_df) > 3:
+            extras = ["Mejor"] * (len(range_df) - 3)
+            labels = labels + extras
+        range_df["CLASE_RANGO"] = labels[:len(range_df)]
 
-    labels = []
-    for i in range(n):
-        pos = (i + 1) / n
-        if pos <= 1/3:
-            labels.append("Peor")
-        elif pos <= 2/3:
-            labels.append("Medio")
-        else:
-            labels.append("Mejor")
-
-    range_df["CLASE_RANGO"] = labels
     return range_df
 
 
 def build_ranges_table(model: DecisionTreeRegressor, model_df: pd.DataFrame) -> pd.DataFrame:
     leaf_ranges = extract_leaf_ranges(model)
+
     leaves_summary = (
         model_df.groupby("LEAF_ID", dropna=False)
         .agg(
@@ -447,7 +443,6 @@ def build_ranges_table(model: DecisionTreeRegressor, model_df: pd.DataFrame) -> 
     range_df = pd.DataFrame(leaf_ranges).merge(leaves_summary, on="leaf_id", how="left")
     range_df["RANGO_X"] = range_df.apply(lambda r: human_range_label(r["x_low"], r["x_high"]), axis=1)
     range_df["REGLA"] = range_df.apply(lambda r: build_rule_text(r["x_low"], r["x_high"], "X"), axis=1)
-
     range_df = assign_leaf_labels(range_df)
 
     cols = [
@@ -456,6 +451,7 @@ def build_ranges_table(model: DecisionTreeRegressor, model_df: pd.DataFrame) -> 
         "Y_PRED_RANGO", "Y_REAL_PROM", "Y_REAL_MIN", "Y_REAL_MAX",
         "CAMPAÑAS", "leaf_id"
     ]
+
     return range_df[cols].sort_values("Y_PRED_RANGO", ascending=False).reset_index(drop=True)
 
 
@@ -464,7 +460,10 @@ def build_rules_text(model: DecisionTreeRegressor, feature_name: str) -> str:
 
 
 def make_scatter_plot(model_df: pd.DataFrame, x_label: str, y_label: str, thresholds: list):
-    title = f"{x_label} vs {y_label} | Árbol de decisión (profundidad = {MAX_DEPTH})"
+    title = (
+        f"{x_label} vs {y_label} | "
+        f"Árbol de decisión (profundidad ≤ {MAX_DEPTH}, hojas = {MAX_LEAF_NODES})"
+    )
 
     fig = px.scatter(
         model_df,
@@ -634,14 +633,26 @@ thresholds = get_thresholds(model)
 ranges_table = build_ranges_table(model, model_df_pred)
 rules_text = build_rules_text(model, feature_name=x_label)
 
+n_total_nodes = int(model.tree_.node_count)
+n_leaf_nodes = int(model.get_n_leaves())
+n_internal_nodes = n_total_nodes - n_leaf_nodes
+real_depth = int(model.get_depth())
+
 # ==========================================================
 # KPIs
 # ==========================================================
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("N observaciones", f"{len(model_df_pred):,}")
-c2.metric("Profundidad fija", f"{MAX_DEPTH}")
-c3.metric("MAE", f"{mae_ref:,.4f}" if pd.notna(mae_ref) else "NA")
-c4.metric("R²", f"{r2_ref:,.4f}" if pd.notna(r2_ref) else "NA")
+c2.metric("Profundidad real", f"{real_depth}")
+c3.metric("Hojas finales", f"{n_leaf_nodes}")
+c4.metric("MAE", f"{mae_ref:,.4f}" if pd.notna(mae_ref) else "NA")
+c5.metric("R²", f"{r2_ref:,.4f}" if pd.notna(r2_ref) else "NA")
+
+st.caption(
+    f"Nodos totales: {n_total_nodes} | "
+    f"Nodos internos: {n_internal_nodes} | "
+    f"Hojas finales: {n_leaf_nodes}"
+)
 
 if metric_mode == "holdout_20":
     st.caption("MAE y R² calculados sobre holdout 20%.")
