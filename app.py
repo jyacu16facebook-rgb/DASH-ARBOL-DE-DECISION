@@ -329,8 +329,6 @@ def build_rf_model_df(dff: pd.DataFrame, y_metric: str) -> pd.DataFrame:
     out["Y_VAL"] = to_numeric_safe(out["Y_VAL"])
 
     out = out.dropna(subset=["Y_VAL"]).copy()
-
-    # Mantener solo filas con al menos una X no nula
     out = out.loc[out[RF_FEATURES].notna().any(axis=1)].copy()
 
     return out
@@ -732,7 +730,6 @@ def run_optuna_and_rf_importance(rf_df: pd.DataFrame):
     imp_df["RANK"] = np.arange(1, len(imp_df) + 1)
     imp_df["VARIABLE_LABEL"] = imp_df["VARIABLE"].map(lambda x: X_LABELS.get(x, x))
 
-    # Ajuste final para cerrar exactamente a 100.00 a nivel numérico
     diff = 100.0 - imp_df["IMPORTANCIA_%"].sum()
     if len(imp_df) > 0:
         imp_df.loc[imp_df.index[0], "IMPORTANCIA_%"] += diff
@@ -760,6 +757,49 @@ def make_importance_plot(imp_df: pd.DataFrame):
         showlegend=False
     )
     return fig
+
+
+def build_explicit_summary_table(
+    imp_df: pd.DataFrame,
+    y_label: str,
+    n_univ: int,
+    pvalor_anova,
+    r2_univ,
+    rmse_rf
+) -> pd.DataFrame:
+    """
+    Tabla explícita e interpretable:
+    - VARIABLE X: variable del modelo RF
+    - VARIABLE Y: métrica seleccionada
+    - N: N del análisis univariable actual
+    - P-VALOR: p-valor del ANOVA de reglas
+    - R2: R² del árbol univariable
+    - RMSE: RMSE del RF multivariable
+    - IMPORTANCIA %: importancia relativa de cada X
+    - RANGO: ranking de importancia
+    """
+    if imp_df is None or imp_df.empty:
+        return pd.DataFrame(columns=[
+            "VARIABLE X", "VARIABLE Y", "N", "P-VALOR", "R2", "RMSE", "IMPORTANCIA %", "RANGO"
+        ])
+
+    summary = imp_df.copy()
+
+    summary["VARIABLE X"] = summary["VARIABLE_LABEL"]
+    summary["VARIABLE Y"] = y_label
+    summary["N"] = int(n_univ) if pd.notna(n_univ) else np.nan
+    summary["P-VALOR"] = pvalor_anova if pd.notna(pvalor_anova) else np.nan
+    summary["R2"] = r2_univ if pd.notna(r2_univ) else np.nan
+    summary["RMSE"] = rmse_rf if pd.notna(rmse_rf) else np.nan
+    summary["IMPORTANCIA %"] = summary["IMPORTANCIA_%"]
+    summary["RANGO"] = summary["RANK"]
+
+    summary = summary[
+        ["VARIABLE X", "VARIABLE Y", "N", "P-VALOR", "R2", "RMSE", "IMPORTANCIA %", "RANGO"]
+    ].copy()
+
+    summary = summary.sort_values(["VARIABLE Y", "RANGO"], ascending=[True, True]).reset_index(drop=True)
+    return summary
 
 
 # ==========================================================
@@ -1020,9 +1060,9 @@ best_params, rf_rmse, rf_r2, imp_df = run_optuna_and_rf_importance(rf_df)
 if imp_df is None:
     st.warning("No hay datos suficientes para calcular importancia de variables con Random Forest.")
 else:
-    r1, r2, r3, r4 = st.columns(4)
+    r1, r2c, r3, r4 = st.columns(4)
     r1.metric("N observaciones RF", f"{len(rf_df):,}")
-    r2.metric("Árboles RF", f"{RF_N_ESTIMATORS:,}")
+    r2c.metric("Árboles RF", f"{RF_N_ESTIMATORS:,}")
     r3.metric("RMSE RF", f"{rf_rmse:,.4f}" if pd.notna(rf_rmse) else "NA")
     r4.metric("R² RF", f"{rf_r2:,.4f}" if pd.notna(rf_r2) else "NA")
 
@@ -1036,20 +1076,31 @@ else:
         imp_fig = make_importance_plot(imp_df)
         st.plotly_chart(imp_fig, use_container_width=True)
 
-        total_pct = float(imp_df["IMPORTANCIA_%"].sum())
-        st.caption(f"Suma de importancias visibles: {total_pct:,.6f}%")
+        # ==========================================================
+        # NUEVA TABLA EXPLÍCITA RESUMEN
+        # Reemplaza la vista eliminada:
+        # - caption "Suma de importancias visibles..."
+        # - tabla original RANK / VARIABLE / IMPORTANCIA_ORIGINAL / IMPORTANCIA_%
+        # ==========================================================
+        st.subheader("Tabla resumen explícita")
 
-        imp_show = imp_df[["RANK", "VARIABLE_LABEL", "IMPORTANCIA_ORIGINAL", "IMPORTANCIA_%"]].copy()
-        imp_show = imp_show.rename(columns={
-            "VARIABLE_LABEL": "VARIABLE",
-            "IMPORTANCIA_ORIGINAL": "IMPORTANCIA_ORIGINAL",
-            "IMPORTANCIA_%": "IMPORTANCIA_%"
-        })
+        explicit_summary = build_explicit_summary_table(
+            imp_df=imp_df,
+            y_label=y_label,
+            n_univ=len(model_df_pred),
+            pvalor_anova=anova_result["pvalor"],
+            r2_univ=r2_ref,
+            rmse_rf=rf_rmse
+        )
 
         st.dataframe(
-            imp_show.style.format({
-                "IMPORTANCIA_ORIGINAL": "{:,.6f}",
-                "IMPORTANCIA_%": "{:,.4f}%"
+            explicit_summary.style.format({
+                "N": "{:,.0f}",
+                "P-VALOR": "{:,.6f}",
+                "R2": "{:,.4f}",
+                "RMSE": "{:,.4f}",
+                "IMPORTANCIA %": "{:,.4f}%",
+                "RANGO": "{:,.0f}",
             }),
             use_container_width=True
         )
