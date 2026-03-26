@@ -3,6 +3,7 @@
 # STREAMLIT APP: Árbol de decisión univariable
 # Fenología vs métricas productivas
 # Optimizado para EXACTAMENTE 3 nodos finales (3 hojas)
+# + Boxplot por regla del árbol con estadísticos
 # ==========================================================
 
 import os
@@ -14,6 +15,7 @@ import plotly.express as px
 from sklearn.tree import DecisionTreeRegressor, export_text, _tree
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
+from scipy.stats import kruskal
 
 # ==========================================================
 # CONFIG
@@ -26,7 +28,7 @@ st.set_page_config(
 REQ_SHEET = "DATA"
 DATA_FILE = "CONSOLIDADO 2022-2026.xlsb"
 MAX_DEPTH = 3
-MAX_LEAF_NODES = 3   # <-- CLAVE: fuerza exactamente 3 hojas finales
+MAX_LEAF_NODES = 3
 RANDOM_STATE = 42
 
 # ==========================================================
@@ -405,8 +407,6 @@ def extract_leaf_ranges(model: DecisionTreeRegressor) -> list:
 def assign_leaf_labels(range_df: pd.DataFrame) -> pd.DataFrame:
     range_df = range_df.sort_values("Y_PRED_RANGO", ascending=True).reset_index(drop=True)
 
-    # Como ahora forzamos 3 hojas, la clasificación queda limpia:
-    # menor = Peor, medio = Medio, mayor = Mejor
     if len(range_df) == 1:
         range_df["CLASE_RANGO"] = ["Único"]
     elif len(range_df) == 2:
@@ -494,6 +494,96 @@ def make_scatter_plot(model_df: pd.DataFrame, x_label: str, y_label: str, thresh
     )
 
     return fig
+
+
+def build_boxplot_df(model_df_pred: pd.DataFrame, ranges_table: pd.DataFrame) -> pd.DataFrame:
+    leaf_map = ranges_table[["leaf_id", "REGLA", "CLASE_RANGO", "RANGO_X"]].copy()
+
+    box_df = model_df_pred.merge(
+        leaf_map,
+        left_on="LEAF_ID",
+        right_on="leaf_id",
+        how="left"
+    ).copy()
+
+    # Orden natural: Peor -> Medio -> Mejor
+    order_df = (
+        ranges_table[["REGLA", "Y_PRED_RANGO"]]
+        .sort_values("Y_PRED_RANGO", ascending=True)
+        .reset_index(drop=True)
+    )
+    rule_order = order_df["REGLA"].tolist()
+    box_df["REGLA"] = pd.Categorical(box_df["REGLA"], categories=rule_order, ordered=True)
+
+    return box_df
+
+
+def make_boxplot(box_df: pd.DataFrame, y_label: str):
+    fig = px.box(
+        box_df,
+        x="REGLA",
+        y="Y_VAL",
+        points="all"
+    )
+
+    fig.update_layout(
+        title=f"{y_label} por REGLA",
+        xaxis_title="REGLA",
+        yaxis_title=y_label,
+        height=620,
+        showlegend=False
+    )
+
+    return fig
+
+
+def compute_boxplot_stats(box_df: pd.DataFrame):
+    stats_rows = []
+
+    grp = (
+        box_df.groupby("REGLA", observed=False)["Y_VAL"]
+        .agg(["count", "mean", "std"])
+        .reset_index()
+    )
+
+    grp = grp.dropna(subset=["REGLA"]).copy()
+
+    for _, row in grp.iterrows():
+        n = int(row["count"])
+        mean_ = float(row["mean"]) if pd.notna(row["mean"]) else np.nan
+        std_ = float(row["std"]) if pd.notna(row["std"]) else 0.0
+        cv_ = (std_ / mean_ * 100) if pd.notna(mean_) and mean_ != 0 else np.nan
+
+        stats_rows.append({
+            "GRUPO": str(row["REGLA"]),
+            "N": n,
+            "MEDIA": mean_,
+            "DESV_STD": std_,
+            "CV(%)": cv_
+        })
+
+    stats_df = pd.DataFrame(stats_rows)
+
+    valid_groups = []
+    for g, sub in box_df.groupby("REGLA", observed=False):
+        vals = pd.to_numeric(sub["Y_VAL"], errors="coerce").dropna().values
+        if len(vals) > 0:
+            valid_groups.append(vals)
+
+    kw_result = {
+        "prueba": "Kruskal-Wallis",
+        "estadistico": np.nan,
+        "pvalor": np.nan,
+        "N": int(box_df["Y_VAL"].notna().sum()),
+        "grupos": int(box_df["REGLA"].dropna().nunique())
+    }
+
+    if len(valid_groups) >= 2:
+        stat, pval = kruskal(*valid_groups)
+        kw_result["estadistico"] = float(stat)
+        kw_result["pvalor"] = float(pval)
+
+    return stats_df, kw_result
 
 
 # ==========================================================
@@ -699,6 +789,34 @@ st.dataframe(
         f"{y_label} promedio real": "{:,.4f}",
         f"{y_label} mínimo real": "{:,.4f}",
         f"{y_label} máximo real": "{:,.4f}",
+    }),
+    use_container_width=True
+)
+
+# ==========================================================
+# BOXPLOT POR REGLA
+# ==========================================================
+st.subheader("Boxplot por regla del árbol")
+st.caption(f"Los tres boxplots responden a la métrica general seleccionada: {y_label}")
+
+box_df = build_boxplot_df(model_df_pred, ranges_table)
+box_fig = make_boxplot(box_df, y_label=y_label)
+st.plotly_chart(box_fig, use_container_width=True)
+
+stats_df, kw_result = compute_boxplot_stats(box_df)
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Prueba", kw_result["prueba"])
+k2.metric("Estadístico (H)", f'{kw_result["estadistico"]:,.4f}' if pd.notna(kw_result["estadistico"]) else "NA")
+k3.metric("p-valor", f'{kw_result["pvalor"]:,.6f}' if pd.notna(kw_result["pvalor"]) else "NA")
+k4.metric("N", f'{kw_result["N"]:,}')
+k5.metric("Grupos", f'{kw_result["grupos"]:,}')
+
+st.dataframe(
+    stats_df.style.format({
+        "MEDIA": "{:,.4f}",
+        "DESV_STD": "{:,.4f}",
+        "CV(%)": "{:,.0f}%"
     }),
     use_container_width=True
 )
