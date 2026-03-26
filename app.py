@@ -4,17 +4,20 @@
 # Fenología vs métricas productivas
 # Optimizado para EXACTAMENTE 3 nodos finales (3 hojas)
 # + Boxplot por regla del árbol con ANOVA
+# + Importancia de variables (Random Forest + Optuna)
 # ==========================================================
 
 import os
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 import plotly.express as px
+import optuna
+
 from sklearn.tree import DecisionTreeRegressor, export_text, _tree
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from scipy.stats import f_oneway
 
 # ==========================================================
@@ -27,9 +30,13 @@ st.set_page_config(
 
 REQ_SHEET = "DATA"
 DATA_FILE = "CONSOLIDADO 2022-2026.xlsb"
+
 MAX_DEPTH = 3
 MAX_LEAF_NODES = 3
 RANDOM_STATE = 42
+
+RF_N_ESTIMATORS = 1000
+OPTUNA_TRIALS = 30
 
 # ==========================================================
 # COLUMNAS REQUERIDAS
@@ -75,6 +82,24 @@ X_OPTIONS = {
     "ALTURA_PLANTA_ULT": "ALTURA_PLANTA_ULT",
     "ANCHO_PLANTA_ULT": "ANCHO_PLANTA_ULT",
 }
+
+RF_FEATURES = [
+    "MADERAS PRINCIPALES",
+    "CORTES",
+    "BROTES TOTALES",
+    "TERMINALES",
+    "BP_N_BROTES_ULT",
+    "BP_LONG_ULT",
+    "BP_DIAM_ULT",
+    "BS_N_BROTES_ULT",
+    "BS_LONG_ULT",
+    "BS_DIAM_ULT",
+    "BT_N_BROTES_ULT",
+    "BT_LONG_ULT",
+    "BT_DIAM_ULT",
+    "ALTURA_PLANTA_ULT",
+    "ANCHO_PLANTA_ULT",
+]
 
 X_LABELS = {
     "MADERAS PRINCIPALES": "MADERAS PRINCIPALES (CONTEO)",
@@ -273,6 +298,40 @@ def build_model_df(dff: pd.DataFrame, x_col: str, y_metric: str) -> pd.DataFrame
     out["X_VAL"] = to_numeric_safe(out["X_VAL"])
     out["Y_VAL"] = to_numeric_safe(out["Y_VAL"])
     out = out.dropna(subset=["X_VAL", "Y_VAL"]).copy()
+
+    return out
+
+
+def build_rf_model_df(dff: pd.DataFrame, y_metric: str) -> pd.DataFrame:
+    if dff.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for keys, g in dff.groupby(UNIT_COLS_BASE, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        rec = {col: keys[i] for i, col in enumerate(UNIT_COLS_BASE)}
+        rec["Y_VAL"] = compute_metric_value(g, y_metric)
+
+        for feat in RF_FEATURES:
+            rec[feat] = simple_mean(g[feat])
+
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["CAMPAÑA"] = out["CAMPAÑA"].astype(str)
+    for feat in RF_FEATURES:
+        out[feat] = to_numeric_safe(out[feat])
+    out["Y_VAL"] = to_numeric_safe(out["Y_VAL"])
+
+    out = out.dropna(subset=["Y_VAL"]).copy()
+
+    # Mantener solo filas con al menos una X no nula
+    out = out.loc[out[RF_FEATURES].notna().any(axis=1)].copy()
 
     return out
 
@@ -587,6 +646,122 @@ def compute_anova_stats(box_df: pd.DataFrame):
     return stats_df, anova_result
 
 
+def impute_medians(df_in: pd.DataFrame, cols: list) -> pd.DataFrame:
+    df_out = df_in.copy()
+    for c in cols:
+        med = df_out[c].median(skipna=True)
+        if pd.isna(med):
+            med = 0.0
+        df_out[c] = df_out[c].fillna(med)
+    return df_out
+
+
+@st.cache_data(show_spinner=False)
+def run_optuna_and_rf_importance(rf_df: pd.DataFrame):
+    if rf_df.empty:
+        return None, None, None, None
+
+    data = rf_df.copy()
+    data = impute_medians(data, RF_FEATURES)
+
+    X = data[RF_FEATURES].copy()
+    y = data["Y_VAL"].copy()
+
+    if len(data) < 10 or y.nunique() < 2:
+        return None, None, None, None
+
+    cv_splits = min(5, max(3, len(data) // 20))
+    cv_splits = max(3, min(cv_splits, len(data)))
+    kf = KFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+
+    def objective(trial):
+        params = {
+            "n_estimators": RF_N_ESTIMATORS,
+            "random_state": RANDOM_STATE,
+            "n_jobs": -1,
+            "bootstrap": trial.suggest_categorical("bootstrap", [True, False]),
+            "max_depth": trial.suggest_int("max_depth", 3, 20),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+            "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5, 0.7, 1.0]),
+        }
+
+        model = RandomForestRegressor(**params)
+        scores = cross_val_score(
+            model,
+            X,
+            y,
+            cv=kf,
+            scoring="neg_root_mean_squared_error",
+            n_jobs=-1
+        )
+        rmse_cv = -scores.mean()
+        return rmse_cv
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=OPTUNA_TRIALS, show_progress_bar=False)
+
+    best_params = study.best_params.copy()
+    final_params = {
+        "n_estimators": RF_N_ESTIMATORS,
+        "random_state": RANDOM_STATE,
+        "n_jobs": -1,
+        **best_params
+    }
+
+    model_final = RandomForestRegressor(**final_params)
+    model_final.fit(X, y)
+
+    y_pred = model_final.predict(X)
+    rmse_full = float(np.sqrt(mean_squared_error(y, y_pred)))
+    r2_full = float(r2_score(y, y_pred)) if y.nunique() > 1 else np.nan
+
+    imp_df = pd.DataFrame({
+        "VARIABLE": RF_FEATURES,
+        "IMPORTANCIA_ORIGINAL": model_final.feature_importances_
+    })
+
+    imp_df = imp_df[imp_df["IMPORTANCIA_ORIGINAL"] > 0].copy()
+    imp_df = imp_df.sort_values("IMPORTANCIA_ORIGINAL", ascending=False).reset_index(drop=True)
+
+    if imp_df.empty:
+        return study.best_params, rmse_full, r2_full, imp_df
+
+    total_non_zero = imp_df["IMPORTANCIA_ORIGINAL"].sum()
+    imp_df["IMPORTANCIA_%"] = (imp_df["IMPORTANCIA_ORIGINAL"] / total_non_zero) * 100
+    imp_df["RANK"] = np.arange(1, len(imp_df) + 1)
+    imp_df["VARIABLE_LABEL"] = imp_df["VARIABLE"].map(lambda x: X_LABELS.get(x, x))
+
+    # Ajuste final para cerrar exactamente a 100.00 a nivel numérico
+    diff = 100.0 - imp_df["IMPORTANCIA_%"].sum()
+    if len(imp_df) > 0:
+        imp_df.loc[imp_df.index[0], "IMPORTANCIA_%"] += diff
+
+    return study.best_params, rmse_full, r2_full, imp_df
+
+
+def make_importance_plot(imp_df: pd.DataFrame):
+    plot_df = imp_df.sort_values("IMPORTANCIA_%", ascending=True).copy()
+
+    fig = px.bar(
+        plot_df,
+        x="IMPORTANCIA_%",
+        y="VARIABLE_LABEL",
+        orientation="h",
+        text="IMPORTANCIA_%"
+    )
+
+    fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+    fig.update_layout(
+        title="Importancia de variables | Random Forest",
+        xaxis_title="Importancia (%)",
+        yaxis_title="Variable",
+        height=max(500, 35 * len(plot_df) + 180),
+        showlegend=False
+    )
+    return fig
+
+
 # ==========================================================
 # LOAD
 # ==========================================================
@@ -717,7 +892,7 @@ if model_df["X_VAL"].nunique() < 2 or model_df["Y_VAL"].nunique() < 2:
     st.stop()
 
 # ==========================================================
-# MODELO
+# MODELO ÁRBOL
 # ==========================================================
 model, model_df_pred, metric_mode, mae_ref, r2_ref = fit_tree_and_metrics(model_df)
 thresholds = get_thresholds(model)
@@ -830,31 +1005,51 @@ st.subheader("Reglas del árbol")
 st.code(rules_text, language="text")
 
 # ==========================================================
-# DETALLE DE DATOS CON RANGO ASIGNADO
+# IMPORTANCIA DE VARIABLES | RANDOM FOREST + OPTUNA
 # ==========================================================
-st.subheader("Detalle por observación")
-
-leaf_map = ranges_table[["leaf_id", "CLASE_RANGO", "RANGO_X"]].copy()
-detail = model_df_pred.merge(leaf_map, left_on="LEAF_ID", right_on="leaf_id", how="left")
-
-detail = detail.rename(columns={
-    "X_VAL": x_label,
-    "Y_VAL": y_label,
-    "Y_PRED": f"{y_label} predicho",
-    "CLASE_RANGO": "Clase rango",
-    "RANGO_X": "Rango X"
-})
-
-detail_cols = [
-    "CAMPAÑA", "FUNDO", "ETAPA", "CAMPO", "TURNO", "VARIEDAD",
-    x_label, y_label, f"{y_label} predicho", "Clase rango", "Rango X"
-]
-
-st.dataframe(
-    detail[detail_cols].sort_values([y_label], ascending=False).style.format({
-        x_label: "{:,.4f}",
-        y_label: "{:,.4f}",
-        f"{y_label} predicho": "{:,.4f}",
-    }),
-    use_container_width=True
+st.subheader("Importancia de variables")
+st.caption(
+    "Modelo multivariable con Random Forest (1000 árboles) optimizado con Optuna "
+    f"({OPTUNA_TRIALS} trials, métrica objetivo = RMSE). "
+    "Se omiten importancias iguales a 0 y las visibles se reescalan para sumar 100%."
 )
+
+rf_df = build_rf_model_df(dff, y_metric=y_pick)
+best_params, rf_rmse, rf_r2, imp_df = run_optuna_and_rf_importance(rf_df)
+
+if imp_df is None:
+    st.warning("No hay datos suficientes para calcular importancia de variables con Random Forest.")
+else:
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("N observaciones RF", f"{len(rf_df):,}")
+    r2.metric("Árboles RF", f"{RF_N_ESTIMATORS:,}")
+    r3.metric("RMSE RF", f"{rf_rmse:,.4f}" if pd.notna(rf_rmse) else "NA")
+    r4.metric("R² RF", f"{rf_r2:,.4f}" if pd.notna(rf_r2) else "NA")
+
+    if best_params is not None:
+        with st.expander("Ver mejores hiperparámetros de Optuna"):
+            st.json(best_params)
+
+    if imp_df.empty:
+        st.warning("Todas las variables tuvieron importancia 0 después del ajuste.")
+    else:
+        imp_fig = make_importance_plot(imp_df)
+        st.plotly_chart(imp_fig, use_container_width=True)
+
+        total_pct = float(imp_df["IMPORTANCIA_%"].sum())
+        st.caption(f"Suma de importancias visibles: {total_pct:,.6f}%")
+
+        imp_show = imp_df[["RANK", "VARIABLE_LABEL", "IMPORTANCIA_ORIGINAL", "IMPORTANCIA_%"]].copy()
+        imp_show = imp_show.rename(columns={
+            "VARIABLE_LABEL": "VARIABLE",
+            "IMPORTANCIA_ORIGINAL": "IMPORTANCIA_ORIGINAL",
+            "IMPORTANCIA_%": "IMPORTANCIA_%"
+        })
+
+        st.dataframe(
+            imp_show.style.format({
+                "IMPORTANCIA_ORIGINAL": "{:,.6f}",
+                "IMPORTANCIA_%": "{:,.4f}%"
+            }),
+            use_container_width=True
+        )
