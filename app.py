@@ -3,11 +3,13 @@
 # STREAMLIT APP: Árbol de decisión univariable
 # Fenología vs métricas productivas
 # Optimizado para EXACTAMENTE 3 nodos finales (3 hojas)
+# + Poda dinámica por tamaño mínimo de hoja (7% del N filtrado)
 # + Boxplot por regla del árbol con ANOVA
 # + Importancia de variables (Random Forest + Optuna)
 # ==========================================================
 
 import os
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -34,6 +36,10 @@ DATA_FILE = "CONSOLIDADO 2022-2026.xlsb"
 MAX_DEPTH = 3
 MAX_LEAF_NODES = 3
 RANDOM_STATE = 42
+
+# PODA DINÁMICA
+MIN_LEAF_RATIO = 0.07   # 7% del N filtrado
+MIN_LEAF_FLOOR = 2      # mínimo absoluto para no permitir hojas de 1 observación
 
 RF_N_ESTIMATORS = 500
 OPTUNA_TRIALS = 15
@@ -360,21 +366,37 @@ def compute_axis_range(series: pd.Series, lower_zero: bool = True):
     return [low, high]
 
 
+def compute_dynamic_tree_params(n_obs: int) -> dict:
+    """
+    Poda dinámica basada en el N filtrado del modelo univariable.
+    Regla principal:
+    - min_samples_leaf = max(2, ceil(7% del N))
+    - min_samples_split = al menos el doble del tamaño mínimo de hoja
+    """
+    min_leaf = max(MIN_LEAF_FLOOR, int(math.ceil(MIN_LEAF_RATIO * n_obs)))
+    min_split = max(4, 2 * min_leaf)
+
+    return {
+        "max_depth": MAX_DEPTH,
+        "max_leaf_nodes": MAX_LEAF_NODES,
+        "random_state": RANDOM_STATE,
+        "min_samples_leaf": min_leaf,
+        "min_samples_split": min_split
+    }
+
+
 def fit_tree_and_metrics(model_df: pd.DataFrame):
     X = model_df[["X_VAL"]].values
     y = model_df["Y_VAL"].values
+    n_obs = len(model_df)
+
+    params = compute_dynamic_tree_params(n_obs)
 
     metric_mode = "full_sample"
     mae_ref = np.nan
     r2_ref = np.nan
 
-    base_params = {
-        "max_depth": MAX_DEPTH,
-        "max_leaf_nodes": MAX_LEAF_NODES,
-        "random_state": RANDOM_STATE
-    }
-
-    model_eval = DecisionTreeRegressor(**base_params)
+    model_eval = DecisionTreeRegressor(**params)
 
     if len(model_df) >= 20 and model_df["X_VAL"].nunique() >= 4:
         X_train, X_test, y_train, y_test = train_test_split(
@@ -391,14 +413,14 @@ def fit_tree_and_metrics(model_df: pd.DataFrame):
         mae_ref = mean_absolute_error(y, y_pred_full)
         r2_ref = r2_score(y, y_pred_full) if len(np.unique(y)) > 1 else np.nan
 
-    model_final = DecisionTreeRegressor(**base_params)
+    model_final = DecisionTreeRegressor(**params)
     model_final.fit(X, y)
 
     model_df = model_df.copy()
     model_df["Y_PRED"] = model_final.predict(X)
     model_df["LEAF_ID"] = model_final.apply(X)
 
-    return model_final, model_df, metric_mode, mae_ref, r2_ref
+    return model_final, model_df, metric_mode, mae_ref, r2_ref, params
 
 
 def get_thresholds(model: DecisionTreeRegressor) -> list:
@@ -519,7 +541,7 @@ def build_rules_text(model: DecisionTreeRegressor, feature_name: str) -> str:
 def make_scatter_plot(model_df: pd.DataFrame, x_label: str, y_label: str, thresholds: list):
     title = (
         f"{x_label} vs {y_label} | "
-        f"Árbol de decisión (profundidad ≤ {MAX_DEPTH}, hojas = {MAX_LEAF_NODES})"
+        f"Árbol de decisión (profundidad ≤ {MAX_DEPTH}, hojas ≤ {MAX_LEAF_NODES})"
     )
 
     fig = px.scatter(
@@ -554,7 +576,7 @@ def make_scatter_plot(model_df: pd.DataFrame, x_label: str, y_label: str, thresh
 
 
 def build_boxplot_df(model_df_pred: pd.DataFrame, ranges_table: pd.DataFrame) -> pd.DataFrame:
-    leaf_map = ranges_table[["leaf_id", "REGLA", "CLASE_RANGO", "RANGO_X"]].copy()
+    leaf_map = ranges_table[["leaf_id", "REGLA", "CLASE_RANGO", "RANGO_X", "Y_PRED_RANGO"]].copy()
 
     box_df = model_df_pred.merge(
         leaf_map,
@@ -563,9 +585,11 @@ def build_boxplot_df(model_df_pred: pd.DataFrame, ranges_table: pd.DataFrame) ->
         how="left"
     ).copy()
 
+    # ORDENAR SIEMPRE DE MEJOR A PEOR
     order_df = (
         ranges_table[["REGLA", "Y_PRED_RANGO"]]
-        .sort_values("Y_PRED_RANGO", ascending=True)
+        .drop_duplicates()
+        .sort_values("Y_PRED_RANGO", ascending=False)
         .reset_index(drop=True)
     )
     rule_order = order_df["REGLA"].tolist()
@@ -579,12 +603,13 @@ def make_boxplot(box_df: pd.DataFrame, y_label: str):
         box_df,
         x="REGLA",
         y="Y_VAL",
-        points="all"
+        points="all",
+        category_orders={"REGLA": list(box_df["REGLA"].cat.categories)}
     )
 
     fig.update_layout(
         title=f"{y_label} por REGLA",
-        xaxis_title="REGLA",
+        xaxis_title="REGLA (ordenado de mejor a peor)",
         yaxis_title=y_label,
         height=620,
         showlegend=False
@@ -621,6 +646,14 @@ def compute_anova_stats(box_df: pd.DataFrame):
         })
 
     stats_df = pd.DataFrame(stats_rows)
+
+    # Mantener orden de mejor a peor en tabla estadística
+    if not stats_df.empty:
+        cat_order = [str(x) for x in box_df["REGLA"].cat.categories] if hasattr(box_df["REGLA"], "cat") else None
+        if cat_order:
+            stats_df["GRUPO"] = pd.Categorical(stats_df["GRUPO"], categories=cat_order, ordered=True)
+            stats_df = stats_df.sort_values("GRUPO").reset_index(drop=True)
+            stats_df["GRUPO"] = stats_df["GRUPO"].astype(str)
 
     valid_groups = []
     for _, sub in box_df.groupby("REGLA", observed=False):
@@ -934,7 +967,7 @@ if model_df["X_VAL"].nunique() < 2 or model_df["Y_VAL"].nunique() < 2:
 # ==========================================================
 # MODELO ÁRBOL
 # ==========================================================
-model, model_df_pred, metric_mode, mae_ref, r2_ref = fit_tree_and_metrics(model_df)
+model, model_df_pred, metric_mode, mae_ref, r2_ref, tree_params = fit_tree_and_metrics(model_df)
 thresholds = get_thresholds(model)
 ranges_table = build_ranges_table(model, model_df_pred)
 rules_text = build_rules_text(model, feature_name=x_label)
@@ -958,6 +991,12 @@ st.caption(
     f"Nodos totales: {n_total_nodes} | "
     f"Nodos internos: {n_internal_nodes} | "
     f"Hojas finales: {n_leaf_nodes}"
+)
+
+st.caption(
+    f"Poda dinámica activa: min_samples_leaf = {tree_params['min_samples_leaf']} "
+    f"({MIN_LEAF_RATIO:.0%} del N filtrado, con piso {MIN_LEAF_FLOOR}) | "
+    f"min_samples_split = {tree_params['min_samples_split']}"
 )
 
 if metric_mode == "holdout_20":
@@ -1013,7 +1052,7 @@ st.dataframe(
 # BOXPLOT + ANOVA
 # ==========================================================
 st.subheader("Boxplot por regla del árbol")
-st.caption(f"Los tres boxplots responden a la métrica general seleccionada: {y_label}")
+st.caption(f"Los boxplots responden a la métrica general seleccionada: {y_label} y están ordenados de mejor a peor.")
 
 box_df = build_boxplot_df(model_df_pred, ranges_table)
 box_fig = make_boxplot(box_df, y_label=y_label)
@@ -1078,9 +1117,6 @@ else:
 
         # ==========================================================
         # NUEVA TABLA EXPLÍCITA RESUMEN
-        # Reemplaza la vista eliminada:
-        # - caption "Suma de importancias visibles..."
-        # - tabla original RANK / VARIABLE / IMPORTANCIA_ORIGINAL / IMPORTANCIA_%
         # ==========================================================
         st.subheader("Tabla resumen explícita")
 
